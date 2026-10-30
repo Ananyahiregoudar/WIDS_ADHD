@@ -1,0 +1,302 @@
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier, StackingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.decomposition import PCA
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import fbeta_score, make_scorer, classification_report
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.ensemble import BalancedRandomForestClassifier, BalancedBaggingClassifier
+from sklearn.feature_selection import SelectFromModel
+from sklearn.calibration import CalibratedClassifierCV
+from xgboost import XGBClassifier
+import optuna
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Load datasets
+def load_data():
+    train_connectome = pd.read_csv("TRAIN_FUNCTIONAL_CONNECTOME_MATRICES_new_36P_Pearson.csv")
+    test_connectome = pd.read_csv("TEST_FUNCTIONAL_CONNECTOME_MATRICES.csv")
+    train_quantitative = pd.read_excel("TRAIN_QUANTITATIVE_METADATA_new.xlsx")
+    train_categorical = pd.read_excel("TRAIN_CATEGORICAL_METADATA_new.xlsx")
+    test_quantitative = pd.read_excel("TEST_QUANTITATIVE_METADATA.xlsx")
+    test_categorical = pd.read_excel("TEST_CATEGORICAL.xlsx")
+    train_solutions = pd.read_excel("TRAINING_SOLUTIONS.xlsx")
+    return (train_connectome, test_connectome, train_quantitative, train_categorical,
+            test_quantitative, test_categorical, train_solutions)
+
+(train_connectome, test_connectome, train_quant, train_cat,
+ test_quant, test_cat, train_solutions) = load_data()
+
+# Data Cleaning & Feature Engineering
+drop_cols = [
+    "Basic_Demos_Study_Site", "MRI_Track_Scan_Location",
+    "PreInt_Demos_Fam_Child_Ethnicity", "PreInt_Demos_Fam_Child_Race",
+    'Barratt_Barratt_P1_Occ', 'Barratt_Barratt_P2_Occ',
+    'MRI_Track_Scanner_Model', 'MRI_Track_Scanner_Manufacturer'
+]
+
+train_cat = train_cat.drop(columns=drop_cols, errors='ignore')
+test_cat = test_cat.drop(columns=drop_cols, errors='ignore')
+
+for col in train_cat.columns:
+    if train_cat[col].isnull().any():
+        if train_cat[col].nunique() < 10:
+            mode_val = train_cat[col].mode()[0]
+            train_cat[col] = train_cat[col].fillna(mode_val)
+            test_cat[col] = test_cat[col].fillna(mode_val)
+        else:
+            train_cat[col] = train_cat[col].fillna('Missing')
+            test_cat[col] = test_cat[col].fillna('Missing')
+
+def enhanced_engineer_features(df, connectome_df=None):
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+
+    if 'EHQ_EHQ_Total' in df.columns and 'APQ_P_APQ_P_CP' in df.columns:
+        df['EHQ_APQ_ratio'] = df['EHQ_EHQ_Total'] / (df['APQ_P_APQ_P_CP'] + 1e-6)
+    if 'SDQ_SDQ_Total' in df.columns and 'CBCL_CBCL_Externalizing' in df.columns:
+        df['SDQ_CBCL_ext_diff'] = df['SDQ_SDQ_Total'] - df['CBCL_CBCL_Externalizing']
+    if 'CBCL_CBCL_Total' in df.columns:
+        df['CBCL_squared'] = df['CBCL_CBCL_Total'] ** 2
+    if 'SDQ_SDQ_Total' in df.columns:
+        df['SDQ_log'] = np.log1p(df['SDQ_SDQ_Total'])
+    sdq_cols = [col for col in df.columns if 'SDQ_' in col]
+    if len(sdq_cols) > 0:
+        df['SDQ_mean'] = df[sdq_cols].mean(axis=1)
+        df['SDQ_std'] = df[sdq_cols].std(axis=1)
+    if connectome_df is not None and 'SDQ_SDQ_Total' in df.columns:
+        for i in range(min(5, connectome_df.shape[1])):
+            df[f'connectome_{i}_SDQ'] = connectome_df.iloc[:, i] * df['SDQ_SDQ_Total']
+    return df
+
+# Preprocessing Pipeline
+cat_cols = [col for col in train_cat.select_dtypes(include=['object']).columns if col != 'participant_id']
+quant_cols = [col for col in train_quant.select_dtypes(include=[np.number]).columns if col != 'participant_id']
+
+numeric_transformer = Pipeline(steps=[
+    ('imputer', KNNImputer(n_neighbors=3)),
+    ('scaler', RobustScaler(quantile_range=(5, 95)))
+])
+
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='Missing')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False, min_frequency=0.05))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numeric_transformer, quant_cols),
+        ('cat', categorical_transformer, cat_cols)
+    ],
+    n_jobs=-1
+)
+
+# Connectome Processing
+train_connectome_ids = train_connectome['participant_id'].astype(str)
+test_connectome_ids = test_connectome['participant_id'].astype(str)
+numeric_connectome_cols = train_connectome.select_dtypes(include=[np.number]).columns
+
+train_connectome_features = train_connectome[numeric_connectome_cols].fillna(train_connectome[numeric_connectome_cols].median())
+test_connectome_features = test_connectome[numeric_connectome_cols].fillna(test_connectome[numeric_connectome_cols].median())
+
+pca = PCA(n_components=100, random_state=42, svd_solver='arpack')
+train_connectome_reduced = pca.fit_transform(train_connectome_features)
+test_connectome_reduced = pca.transform(test_connectome_features)
+
+train_connectome_df = pd.DataFrame(train_connectome_reduced, index=train_connectome_ids)
+test_connectome_df = pd.DataFrame(test_connectome_reduced, index=test_connectome_ids)
+
+# Apply feature engineering with connectome interactions
+train_quant = enhanced_engineer_features(train_quant, train_connectome_df)
+test_quant = enhanced_engineer_features(test_quant, test_connectome_df)
+
+# Merge data
+train_df = train_cat.merge(train_quant, on='participant_id').merge(train_solutions, on='participant_id')
+test_df = test_cat.merge(test_quant, on='participant_id')
+
+# Combine Features
+train_df['participant_id'] = train_df['participant_id'].astype(str)
+train_connectome_df.index = train_connectome_df.index.astype(str)
+
+common_ids = train_df['participant_id'].isin(train_connectome_df.index)
+train_df = train_df[common_ids]
+y_full_train = train_df[['ADHD_Outcome', 'Sex_F']].values
+
+X_full_train = np.hstack([
+    preprocessor.fit_transform(train_df[cat_cols + quant_cols]),
+    train_connectome_df.loc[train_df['participant_id']].values
+])
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_full_train, y_full_train,
+    test_size=0.2,
+    stratify=y_full_train[:, 0],
+    random_state=42
+)
+
+# Custom Weighted F2 Score
+def weighted_f2_score(y_true, y_pred, weight_female_adhd=3.0):
+    y_true_adhd, y_true_sex = y_true[:, 0], y_true[:, 1]
+    y_pred_adhd, y_pred_sex = y_pred[:, 0], y_pred[:, 1]
+    sample_weights = np.ones_like(y_true_adhd)
+    female_adhd_mask = (y_true_adhd == 1) & (y_true_sex == 1)
+    sample_weights[female_adhd_mask] = weight_female_adhd
+    f2_adhd = fbeta_score(y_true_adhd, y_pred_adhd, beta=2, sample_weight=sample_weights)
+    f2_sex = fbeta_score(y_true_sex, y_pred_sex, beta=2)
+    return 0.75 * f2_adhd + 0.25 * f2_sex
+
+weighted_f2_scorer = make_scorer(weighted_f2_score, greater_is_better=True)
+
+# ADHD Model
+adhd_base_models = [
+    ('hgb', HistGradientBoostingClassifier(
+        random_state=42, max_iter=250, learning_rate=0.08, max_depth=5, min_samples_leaf=20,
+        early_stopping=True, l2_regularization=0.15
+    )),
+    ('rf', BalancedRandomForestClassifier(
+        random_state=42, n_estimators=200, max_depth=7, class_weight='balanced_subsample', max_samples=0.9
+    )),
+    ('xgb', XGBClassifier(
+        random_state=42, max_depth=4, n_estimators=150, scale_pos_weight=2.5, learning_rate=0.1
+    ))
+]
+
+adhd_model = StackingClassifier(
+    estimators=adhd_base_models,
+    final_estimator=LogisticRegression(class_weight='balanced', penalty='l2', solver='liblinear'),
+    stack_method='predict_proba',
+    n_jobs=-1
+)
+
+adhd_pipeline = ImbPipeline([
+    ('smote', SMOTE(random_state=42, sampling_strategy=0.8)),
+    ('feature_select', SelectFromModel(
+        LogisticRegression(penalty='l2', solver='liblinear', random_state=42), max_features=120
+    )),
+    ('calibrate', CalibratedClassifierCV(adhd_model, method='sigmoid', cv=5))
+])
+
+# Sex Model
+sex_model = BalancedBaggingClassifier(
+    estimator=RandomForestClassifier(
+        class_weight='balanced_subsample', max_depth=6, n_estimators=120, max_features='sqrt'
+    ),
+    n_estimators=10,
+    sampling_strategy='auto',
+    replacement=True,
+    random_state=42
+)
+
+sex_pipeline = ImbPipeline([
+    ('smote', SMOTE(random_state=42, sampling_strategy=0.8)),
+    ('feature_select', SelectFromModel(
+        RandomForestClassifier(random_state=42), max_features=60
+    )),
+    ('model', sex_model)
+])
+
+# Hyperparameter Optimization with Optuna
+def optimize_adhd(trial):
+    params = {
+        'smote__k_neighbors': trial.suggest_int('smote_k_neighbors', 3, 7),
+        'feature_select__max_features': trial.suggest_int('max_features', 50, min(118, X_train.shape[1])),
+        'calibrate__estimator__hgb__learning_rate': trial.suggest_float('hgb_lr', 0.05, 0.15),
+        'calibrate__estimator__xgb__learning_rate': trial.suggest_float('xgb_lr', 0.05, 0.15)
+    }
+    adhd_pipeline.set_params(**params)
+    cv_scores = []
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(X_train, y_train[:, 0]):
+        X_t, X_v = X_train[train_idx], X_train[val_idx]
+        y_t, y_v = y_train[train_idx, 0], y_train[val_idx, 0]
+        adhd_pipeline.fit(X_t, y_t)
+        y_pred = adhd_pipeline.predict(X_v)
+        cv_scores.append(fbeta_score(y_v, y_pred, beta=2))
+    return np.mean(cv_scores)
+
+def optimize_sex(trial):
+    params = {
+        'smote__k_neighbors': trial.suggest_int('smote_k_neighbors', 3, 7),
+        'feature_select__max_features': trial.suggest_int('max_features', 50, 80),
+        'model__estimator__max_depth': trial.suggest_int('rf_max_depth', 5, 8)
+    }
+    sex_pipeline.set_params(**params)
+    cv_scores = []
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(X_train, y_train[:, 1]):
+        X_t, X_v = X_train[train_idx], X_train[val_idx]
+        y_t, y_v = y_train[train_idx, 1], y_train[val_idx, 1]
+        sex_pipeline.fit(X_t, y_t)
+        y_pred = sex_pipeline.predict(X_v)
+        cv_scores.append(fbeta_score(y_v, y_pred, beta=2))
+    return np.mean(cv_scores)
+
+study_adhd = optuna.create_study(direction='maximize')
+study_adhd.optimize(optimize_adhd, n_trials=20)
+best_adhd_params = study_adhd.best_params
+adhd_pipeline.set_params(
+    smote__k_neighbors=best_adhd_params['smote_k_neighbors'],
+    feature_select__max_features=best_adhd_params['max_features'],
+    calibrate__estimator__hgb__learning_rate=best_adhd_params['hgb_lr'],
+    calibrate__estimator__xgb__learning_rate=best_adhd_params['xgb_lr']
+)
+
+study_sex = optuna.create_study(direction='maximize')
+study_sex.optimize(optimize_sex, n_trials=20)
+best_sex_params = study_sex.best_params
+sex_pipeline.set_params(
+    smote__k_neighbors=best_sex_params['smote_k_neighbors'],
+    feature_select__max_features=best_sex_params['max_features'],
+    model__estimator__max_depth=best_sex_params['rf_max_depth']
+)
+
+# Train Models
+print("Training ADHD Model...")
+best_adhd_model = adhd_pipeline.fit(X_train, y_train[:, 0])
+print("Training Sex Model...")
+best_sex_model = sex_pipeline.fit(X_train, y_train[:, 1])
+
+# Validation Performance
+y_val_pred_adhd = best_adhd_model.predict(X_val)
+y_val_pred_sex = best_sex_model.predict(X_val)
+
+print("\nADHD_Outcome Classification Report:")
+print(classification_report(y_val[:, 0], y_val_pred_adhd))
+print("\nSex_F Classification Report:")
+print(classification_report(y_val[:, 1], y_val_pred_sex))
+
+weighted_f2_val = weighted_f2_score(y_val, np.column_stack((y_val_pred_adhd, y_val_pred_sex)))
+print(f"\nWeighted F2 Score (Validation): {weighted_f2_val:.4f}")
+
+# Final Training
+print("\nTraining final models on full data...")
+final_adhd_model = best_adhd_model.fit(X_full_train, y_full_train[:, 0])
+final_sex_model = best_sex_model.fit(X_full_train, y_full_train[:, 1])
+
+# Test Predictions
+test_df['participant_id'] = test_df['participant_id'].astype(str)
+test_connectome_df.index = test_connectome_df.index.astype(str)
+
+X_test = np.hstack([
+    preprocessor.transform(test_df[cat_cols + quant_cols]),
+    test_connectome_df.loc[test_df['participant_id']].values
+])
+
+adhd_preds = final_adhd_model.predict(X_test)
+sex_preds = final_sex_model.predict(X_test)
+
+submission = pd.DataFrame({
+    'participant_id': test_df['participant_id'],
+    'ADHD_Outcome': adhd_preds,
+    'Sex_F': sex_preds
+})
+submission.to_csv('submission.csv', index=False)
+print("\nSubmission file saved as 'submission.csv'")
+```
